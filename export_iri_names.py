@@ -1,4 +1,4 @@
-"""Составить таблицу исходных наименований или обновить ссылки IRI и комментарии DM в маппинге."""
+"""Составить таблицу исходных наименований или заменить ссылки IRI в маппинге."""
 
 import argparse
 import codecs
@@ -100,8 +100,8 @@ def mapping_rules(logged, dm_source_prefix):
     if not re.fullmatch(IRI, dm_source_prefix) or not dm_source_prefix.endswith(("#", "/")):
         raise ValueError("Для --dm-source-prefix нужен полный исходный префикс IRI с # или / на конце.")
     dm_targets = {URIRef(dm_source_prefix + name): URIRef(new) for name, _, new in DM_COMMENT_PAIRS}
-    comments = {URIRef(new): text for _, text, new in DM_COMMENT_PAIRS}
-    if len(dm_targets) != len(DM_COMMENT_PAIRS) or len(comments) != len(DM_COMMENT_PAIRS):
+    final_iris = set(dm_targets.values())
+    if len(dm_targets) != len(DM_COMMENT_PAIRS) or len(final_iris) != len(DM_COMMENT_PAIRS):
         raise ValueError("В таблице DM повторяется исходное имя или целевой IRI.")
 
     pairs = dm_targets.copy()
@@ -110,14 +110,14 @@ def mapping_rules(logged, dm_source_prefix):
         target = dm_targets.get(new, new)
         if old in dm_targets and target != dm_targets[old]:
             raise ValueError(f"Для {old} журнал задаёт {new}, а таблица DM задаёт {dm_targets[old]}.")
-        if old in comments and target != old:
+        if old in final_iris and target != old:
             raise ValueError(f"Журнал переназначает конечный IRI класса DM {old} на {target}.")
         pairs[old] = target
-    return pairs, comments
+    return pairs
 
 
-def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
-    """Обновить OWL-ссылки и дополнить аннотации классов DM, встречающихся в маппинге."""
+def replace_iris(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
+    """Заменить IRI в графе маппинга и вернуть число замен и отсутствующие IRI журнала."""
     # В офлайн-комплекте Python импортирует модули прямо из файлов wheel.
     package_dir = Path(__file__).resolve().with_name("iri_packages")
     if package_dir.is_dir():
@@ -127,7 +127,6 @@ def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
         import rdflib
         from rdflib import Graph, Literal, URIRef
         from rdflib.exceptions import ParserError
-        from rdflib.namespace import RDFS, XSD
     except ImportError as error:
         raise ImportError(
             f"Не удалось загрузить RDFLib ({error}). Распакуйте полный архив ветки "
@@ -136,7 +135,7 @@ def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
 
     source, log, destination = checked_paths(source, log, destination)
     logged = {URIRef(old): URIRef(new) for old, new in read_pairs(log).items()} if log else {}
-    pairs, dm_comments = mapping_rules(logged, dm_source_prefix)
+    pairs = mapping_rules(logged, dm_source_prefix)
     original = Graph()
     with source.open("rb") as model:
         # OWL/XML и сокращённый RDF/XML могут оба начинаться с owl:Ontology.
@@ -164,14 +163,11 @@ def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
     for prefix, namespace in original.namespaces():
         result.bind(prefix, namespace)
     found = set()
-    present_dm = set()
 
     def mapped(term):
         if term in pairs:
             found.add(term)
-            term = pairs[term]
-        if term in dm_comments:
-            present_dm.add(term)
+            return pairs[term]
         return term
 
     for subject, predicate, obj in original:
@@ -184,15 +180,6 @@ def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
                 obj = Literal(str(obj), datatype=datatype, normalize=False)
         result.add((mapped(subject), mapped(predicate), obj))
 
-    added = 0
-    for cls in present_dm:
-        text = dm_comments[cls]
-        existing = result.objects(cls, RDFS.comment)
-        if any(isinstance(value, Literal) and str(value) == text for value in existing):
-            continue
-        result.add((cls, RDFS.comment, Literal(text, datatype=XSD.string)))
-        added += 1
-
     output = NamedTemporaryFile(dir=destination.parent, delete=False)
     temporary = Path(output.name)
     try:
@@ -201,13 +188,13 @@ def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
-    return sum(pairs[old] != old for old in found), added, sorted(set(logged) - found)
+    return sum(pairs[old] != old for old in found), sorted(set(logged) - found)
 
 
-def replace_iris(source, log, destination):
-    """Сохранить прежний формат результата для вызова из Python."""
-    count, _, absent = update_mapping(source, log, destination)
-    return count, absent
+def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
+    """Для прежних вызовов из Python вернуть также число добавленных комментариев (всегда 0)."""
+    count, absent = replace_iris(source, log, destination, dm_source_prefix)
+    return count, 0, absent
 
 
 def choose_files(replace=False):
@@ -236,7 +223,7 @@ def choose_files(replace=False):
             return None
         use_log = not replace or messagebox.askyesnocancel(
             "Список замен", "Применить также замены из pairs.txt?\n\n"
-            "Да — прежние замены и обновления DM.\nНет — только обновления DM.", parent=root,
+            "Да — IRI из журнала и схемы DM.\nНет — только IRI схемы DM.", parent=root,
         )
         if use_log is None:
             return None
@@ -287,8 +274,8 @@ def main():
             return
         replace, source, log, destination = job
         if replace:
-            count, added, absent = update_mapping(source, log, destination, args.dm_source_prefix)
-            print(f"Сохранено в {destination}. Заменено различных IRI: {count}. Добавлено комментариев DM: {added}.")
+            count, absent = replace_iris(source, log, destination, args.dm_source_prefix)
+            print(f"Сохранено в {destination}. Заменено различных IRI: {count}.")
             if absent:
                 print("В модели маппинга отсутствуют следующие старые IRI:", *absent, sep="\n")
             return
