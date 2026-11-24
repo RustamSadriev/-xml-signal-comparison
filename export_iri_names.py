@@ -91,12 +91,20 @@ def export_report(source, log, destination):
 
 def replace_iris(source, log, destination):
     """Заменить полные IRI в графе RDF/XML за один проход по исходным утверждениям."""
+    # В офлайн-комплекте Python импортирует модули прямо из файлов wheel.
+    package_dir = Path(__file__).resolve().with_name("iri_packages")
+    if package_dir.is_dir():
+        wheels = [str(path) for path in sorted(package_dir.glob("*.whl"))]
+        sys.path[:0] = [path for path in wheels if path not in sys.path]
     try:
         import rdflib
         from rdflib import Graph, Literal, URIRef
         from rdflib.exceptions import ParserError
     except ImportError as error:
-        raise ImportError("Для замены IRI установите rdflib в интерпретатор проекта.") from error
+        raise ImportError(
+            f"Не удалось загрузить RDFLib ({error}). Распакуйте полный архив ветки "
+            "export-iri-names и запустите скрипт рядом с папкой iri_packages."
+        ) from error
 
     source, log, destination = checked_paths(source, log, destination)
     pairs = {URIRef(old): URIRef(new) for old, new in read_pairs(log).items()}
