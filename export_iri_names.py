@@ -1,4 +1,4 @@
-"""Составить таблицу с исходными наименованиями или заменить ссылки IRI в модели маппинга."""
+"""Составить таблицу исходных наименований или обновить ссылки IRI и комментарии DM в маппинге."""
 
 import argparse
 import codecs
@@ -13,6 +13,7 @@ from xml.sax import SAXException
 
 IRI = r"[A-Za-z][A-Za-z0-9+.\-]*:[^\s<>]+"
 PAIR = re.compile(rf"({IRI})\s+(?:->|→)\s+({IRI})")
+DM_SOURCE_PREFIX = "http://company.classification/signals#"
 
 
 def read_pairs(path):
@@ -42,9 +43,9 @@ def read_pairs(path):
 
 def checked_paths(source, log, destination):
     source = Path(source).resolve(strict=True)
-    log = Path(log).resolve(strict=True)
+    log = Path(log).resolve(strict=True) if log is not None else None
     destination = Path(destination).resolve()
-    if destination.exists() and any(destination.samefile(path) for path in (source, log)):
+    if destination.exists() and any(destination.samefile(path) for path in (source, log) if path is not None):
         raise ValueError("Выберите отдельный выходной файл.")
     return source, log, destination
 
@@ -89,8 +90,34 @@ def export_report(source, log, destination):
     return row_count, missing
 
 
-def replace_iris(source, log, destination):
-    """Заменить полные IRI в графе RDF/XML за один проход по исходным утверждениям."""
+def mapping_rules(logged, dm_source_prefix):
+    from rdflib import URIRef
+    try:
+        from dm_comment_pairs import DM_COMMENT_PAIRS
+    except ImportError as error:
+        raise ImportError("Положите dm_comment_pairs.py из ветки export-iri-names рядом со скриптом.") from error
+
+    if not re.fullmatch(IRI, dm_source_prefix) or not dm_source_prefix.endswith(("#", "/")):
+        raise ValueError("Для --dm-source-prefix нужен полный исходный префикс IRI с # или / на конце.")
+    dm_targets = {URIRef(dm_source_prefix + name): URIRef(new) for name, _, new in DM_COMMENT_PAIRS}
+    comments = {URIRef(new): text for _, text, new in DM_COMMENT_PAIRS}
+    if len(dm_targets) != len(DM_COMMENT_PAIRS) or len(comments) != len(DM_COMMENT_PAIRS):
+        raise ValueError("В таблице DM повторяется исходное имя или целевой IRI.")
+
+    pairs = dm_targets.copy()
+    for old, new in logged.items():
+        # Журнал может вести к IRI класса до последнего обновления DM.
+        target = dm_targets.get(new, new)
+        if old in dm_targets and target != dm_targets[old]:
+            raise ValueError(f"Для {old} журнал задаёт {new}, а таблица DM задаёт {dm_targets[old]}.")
+        if old in comments and target != old:
+            raise ValueError(f"Журнал переназначает конечный IRI класса DM {old} на {target}.")
+        pairs[old] = target
+    return pairs, comments
+
+
+def update_mapping(source, log, destination, dm_source_prefix=DM_SOURCE_PREFIX):
+    """Обновить OWL-ссылки и дополнить аннотации классов DM, встречающихся в маппинге."""
     # В офлайн-комплекте Python импортирует модули прямо из файлов wheel.
     package_dir = Path(__file__).resolve().with_name("iri_packages")
     if package_dir.is_dir():
@@ -100,6 +127,7 @@ def replace_iris(source, log, destination):
         import rdflib
         from rdflib import Graph, Literal, URIRef
         from rdflib.exceptions import ParserError
+        from rdflib.namespace import RDFS, XSD
     except ImportError as error:
         raise ImportError(
             f"Не удалось загрузить RDFLib ({error}). Распакуйте полный архив ветки "
@@ -107,7 +135,8 @@ def replace_iris(source, log, destination):
         ) from error
 
     source, log, destination = checked_paths(source, log, destination)
-    pairs = {URIRef(old): URIRef(new) for old, new in read_pairs(log).items()}
+    logged = {URIRef(old): URIRef(new) for old, new in read_pairs(log).items()} if log else {}
+    pairs, dm_comments = mapping_rules(logged, dm_source_prefix)
     original = Graph()
     with source.open("rb") as model:
         # OWL/XML и сокращённый RDF/XML могут оба начинаться с owl:Ontology.
@@ -135,20 +164,34 @@ def replace_iris(source, log, destination):
     for prefix, namespace in original.namespaces():
         result.bind(prefix, namespace)
     found = set()
+    present_dm = set()
 
     def mapped(term):
         if term in pairs:
             found.add(term)
-            return pairs[term]
+            term = pairs[term]
+        if term in dm_comments:
+            present_dm.add(term)
         return term
 
     for subject, predicate, obj in original:
         if isinstance(obj, URIRef):
             obj = mapped(obj)
-        elif isinstance(obj, Literal) and obj.datatype in pairs:
+        elif isinstance(obj, Literal) and obj.datatype is not None:
             # Тип литерала — ссылка, его текст остаётся прежним.
-            obj = Literal(str(obj), datatype=mapped(obj.datatype), normalize=False)
+            datatype = mapped(obj.datatype)
+            if datatype != obj.datatype:
+                obj = Literal(str(obj), datatype=datatype, normalize=False)
         result.add((mapped(subject), mapped(predicate), obj))
+
+    added = 0
+    for cls in present_dm:
+        text = dm_comments[cls]
+        existing = result.objects(cls, RDFS.comment)
+        if any(isinstance(value, Literal) and str(value) == text for value in existing):
+            continue
+        result.add((cls, RDFS.comment, Literal(text, datatype=XSD.string)))
+        added += 1
 
     output = NamedTemporaryFile(dir=destination.parent, delete=False)
     temporary = Path(output.name)
@@ -158,7 +201,13 @@ def replace_iris(source, log, destination):
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
-    return sum(pairs[old] != old for old in found), sorted(set(pairs) - found)
+    return sum(pairs[old] != old for old in found), added, sorted(set(logged) - found)
+
+
+def replace_iris(source, log, destination):
+    """Сохранить прежний формат результата для вызова из Python."""
+    count, _, absent = update_mapping(source, log, destination)
+    return count, absent
 
 
 def choose_files(replace=False):
@@ -167,7 +216,7 @@ def choose_files(replace=False):
     try:
         root = Tk()
     except TclError as error:
-        raise OSError("Окно недоступно. Передайте три пути в командной строке.") from error
+        raise OSError("Окно недоступно. Передайте пути к файлам в командной строке.") from error
     try:
         root.withdraw()
         if not replace:
@@ -185,12 +234,20 @@ def choose_files(replace=False):
         )
         if not source:
             return None
-        log = filedialog.askopenfilename(
-            parent=root, title="Выберите сохранённые строки со старыми и новыми IRI",
-            initialdir=str(Path(source).parent), filetypes=[("Текст", "*.txt"), ("Все файлы", "*")],
+        use_log = not replace or messagebox.askyesnocancel(
+            "Список замен", "Применить также замены из pairs.txt?\n\n"
+            "Да — прежние замены и обновления DM.\nНет — только обновления DM.", parent=root,
         )
-        if not log:
+        if use_log is None:
             return None
+        log = None
+        if use_log:
+            log = filedialog.askopenfilename(
+                parent=root, title="Выберите сохранённые строки со старыми и новыми IRI",
+                initialdir=str(Path(source).parent), filetypes=[("Текст", "*.txt"), ("Все файлы", "*")],
+            )
+            if not log:
+                return None
         if replace:
             path = Path(source)
             destination = filedialog.asksaveasfilename(
@@ -211,20 +268,27 @@ def choose_files(replace=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--replace-iris", action="store_true", help="Заменить IRI в модели маппинга (RDF/XML)")
+    parser.add_argument("--dm-source-prefix", default=DM_SOURCE_PREFIX,
+                        help=f"Исходный префикс IRI классов DM (по умолчанию {DM_SOURCE_PREFIX})")
     parser.add_argument("source", nargs="?", help="Старая модель для CSV или модель маппинга для замены IRI")
-    parser.add_argument("log", nargs="?", help="Сохранённый вывод переименования .txt")
+    parser.add_argument("log", nargs="?", help="Сохранённый вывод .txt (можно опустить для замены только DM)")
     parser.add_argument("output", nargs="?", help="Куда сохранить .csv или обновлённый .owl")
     args = parser.parse_args()
+    if args.replace_iris and args.log and args.output is None:
+        # При пропуске выходного пути нельзя перезаписать журнал файлом RDF/XML.
+        if Path(args.log).suffix.lower() not in (".owl", ".rdf", ".xml"):
+            parser.error("Укажите выходной файл модели (.owl, .rdf или .xml) после входных файлов.")
+        args.output, args.log = args.log, None
     if args.source and not args.output:
-        parser.error("Передайте все три пути или запустите без аргументов для выбора файлов.")
+        parser.error("Для CSV укажите три пути, для замены — модель, необязательный журнал и выходной файл.")
     try:
         job = (args.replace_iris, args.source, args.log, args.output) if args.source else choose_files(args.replace_iris)
         if not job:
             return
         replace, source, log, destination = job
         if replace:
-            count, absent = replace_iris(source, log, destination)
-            print(f"Сохранено в {destination}. Заменено различных IRI: {count}.")
+            count, added, absent = update_mapping(source, log, destination, args.dm_source_prefix)
+            print(f"Сохранено в {destination}. Заменено различных IRI: {count}. Добавлено комментариев DM: {added}.")
             if absent:
                 print("В модели маппинга отсутствуют следующие старые IRI:", *absent, sep="\n")
             return
