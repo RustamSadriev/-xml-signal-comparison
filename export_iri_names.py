@@ -1,4 +1,4 @@
-"""Дополнить сохранённые пары старый IRI -> новый IRI наименованиями из исходной OWL-модели."""
+"""Составить таблицу с исходными наименованиями или заменить ссылки IRI в модели маппинга."""
 
 import argparse
 import codecs
@@ -7,8 +7,8 @@ import re
 import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-
-from owlready2 import World, comment
+from xml.etree import ElementTree
+from xml.sax import SAXException
 
 
 IRI = r"[A-Za-z][A-Za-z0-9+.\-]*:[^\s<>]+"
@@ -40,12 +40,19 @@ def read_pairs(path):
     return pairs
 
 
-def export_report(source, log, destination):
+def checked_paths(source, log, destination):
     source = Path(source).resolve(strict=True)
     log = Path(log).resolve(strict=True)
     destination = Path(destination).resolve()
     if destination.exists() and any(destination.samefile(path) for path in (source, log)):
-        raise ValueError("Выберите отдельный файл для отчёта CSV.")
+        raise ValueError("Выберите отдельный выходной файл.")
+    return source, log, destination
+
+
+def export_report(source, log, destination):
+    from owlready2 import World, comment
+
+    source, log, destination = checked_paths(source, log, destination)
     pairs = read_pairs(log)
     missing = []
     row_count = 0
@@ -82,8 +89,72 @@ def export_report(source, log, destination):
     return row_count, missing
 
 
-def choose_files():
-    from tkinter import TclError, Tk, filedialog
+def replace_iris(source, log, destination):
+    """Заменить полные IRI в графе RDF/XML за один проход по исходным утверждениям."""
+    try:
+        import rdflib
+        from rdflib import Graph, Literal, URIRef
+        from rdflib.exceptions import ParserError
+    except ImportError as error:
+        raise ImportError("Для замены IRI установите rdflib в интерпретатор проекта.") from error
+
+    source, log, destination = checked_paths(source, log, destination)
+    pairs = {URIRef(old): URIRef(new) for old, new in read_pairs(log).items()}
+    original = Graph()
+    with source.open("rb") as model:
+        # OWL/XML и сокращённый RDF/XML могут оба начинаться с owl:Ontology.
+        elements = ElementTree.iterparse(model, events=("start",))
+        root = next(elements)[1]
+        owl = "{http://www.w3.org/2002/07/owl#}"
+        if root.tag == owl + "Ontology":
+            first_child = next(elements, (None, None))[1]
+            is_axiom = (first_child is not None and first_child.tag.startswith(owl)
+                        and first_child.tag[len(owl):][:1].isupper())
+            if is_axiom or "ontologyIRI" in root.attrib or "versionIRI" in root.attrib:
+                raise ValueError("Сохраните модель маппинга в Protégé в формате RDF/XML.")
+        model.seek(0)
+        # RDFLib по умолчанию превращает, например, "007"^^xsd:integer в "7".
+        normalize = rdflib.NORMALIZE_LITERALS
+        try:
+            rdflib.NORMALIZE_LITERALS = False
+            original.parse(model, format="xml", publicID=source.as_uri())
+        except (SAXException, ParserError) as error:
+            raise ValueError(f"Не удалось прочитать модель маппинга как RDF/XML: {error}") from error
+        finally:
+            rdflib.NORMALIZE_LITERALS = normalize
+
+    result = Graph()
+    for prefix, namespace in original.namespaces():
+        result.bind(prefix, namespace)
+    found = set()
+
+    def mapped(term):
+        if term in pairs:
+            found.add(term)
+            return pairs[term]
+        return term
+
+    for subject, predicate, obj in original:
+        if isinstance(obj, URIRef):
+            obj = mapped(obj)
+        elif isinstance(obj, Literal) and obj.datatype in pairs:
+            # Тип литерала — ссылка, его текст остаётся прежним.
+            obj = Literal(str(obj), datatype=mapped(obj.datatype), normalize=False)
+        result.add((mapped(subject), mapped(predicate), obj))
+
+    output = NamedTemporaryFile(dir=destination.parent, delete=False)
+    temporary = Path(output.name)
+    try:
+        with output:
+            result.serialize(destination=output, format="xml", encoding="utf-8")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return sum(pairs[old] != old for old in found), sorted(set(pairs) - found)
+
+
+def choose_files(replace=False):
+    from tkinter import TclError, Tk, filedialog, messagebox
 
     try:
         root = Tk()
@@ -91,8 +162,17 @@ def choose_files():
         raise OSError("Окно недоступно. Передайте три пути в командной строке.") from error
     try:
         root.withdraw()
+        if not replace:
+            replace = messagebox.askyesnocancel(
+                "Действие", "Заменить ссылки IRI в модели маппинга?\n\n"
+                "Да — сохранить обновлённую OWL-модель.\nНет — составить таблицу CSV.",
+                parent=root,
+            )
+            if replace is None:
+                return None
+        title = "Выберите модель маппинга для замены IRI" if replace else "Выберите исходную OWL-модель со старыми IRI"
         source = filedialog.askopenfilename(
-            parent=root, title="Выберите исходную OWL-модель со старыми IRI",
+            parent=root, title=title,
             filetypes=[("Модель OWL", "*.owl"), ("Все файлы", "*")],
         )
         if not source:
@@ -103,33 +183,47 @@ def choose_files():
         )
         if not log:
             return None
-        destination = filedialog.asksaveasfilename(
-            parent=root, title="Сохранить таблицу наименований", initialdir=str(Path(log).parent),
-            initialfile=f"{Path(source).stem}_iri.csv", defaultextension=".csv",
-            filetypes=[("Таблица CSV", "*.csv")],
-        )
+        if replace:
+            path = Path(source)
+            destination = filedialog.asksaveasfilename(
+                parent=root, title="Сохранить обновлённую модель маппинга", initialdir=str(path.parent),
+                initialfile=f"{path.stem}_updated.owl", defaultextension=".owl", filetypes=[("Модель OWL", "*.owl")],
+            )
+        else:
+            destination = filedialog.asksaveasfilename(
+                parent=root, title="Сохранить таблицу наименований", initialdir=str(Path(log).parent),
+                initialfile=f"{Path(source).stem}_iri.csv", defaultextension=".csv", filetypes=[("Таблица CSV", "*.csv")],
+            )
         if destination:
-            return source, log, destination
+            return replace, source, log, destination
     finally:
         root.destroy()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", nargs="?", help="Исходная модель .owl")
+    parser.add_argument("--replace-iris", action="store_true", help="Заменить IRI в модели маппинга (RDF/XML)")
+    parser.add_argument("source", nargs="?", help="Старая модель для CSV или модель маппинга для замены IRI")
     parser.add_argument("log", nargs="?", help="Сохранённый вывод переименования .txt")
-    parser.add_argument("output", nargs="?", help="Куда сохранить .csv")
+    parser.add_argument("output", nargs="?", help="Куда сохранить .csv или обновлённый .owl")
     args = parser.parse_args()
     if args.source and not args.output:
         parser.error("Передайте все три пути или запустите без аргументов для выбора файлов.")
     try:
-        paths = (args.source, args.log, args.output) if args.source else choose_files()
-        if not paths:
+        job = (args.replace_iris, args.source, args.log, args.output) if args.source else choose_files(args.replace_iris)
+        if not job:
             return
-        rows, missing = export_report(*paths)
-    except (ImportError, OSError, ValueError) as error:
+        replace, source, log, destination = job
+        if replace:
+            count, absent = replace_iris(source, log, destination)
+            print(f"Сохранено в {destination}. Заменено различных IRI: {count}.")
+            if absent:
+                print("В модели маппинга отсутствуют следующие старые IRI:", *absent, sep="\n")
+            return
+        rows, missing = export_report(source, log, destination)
+    except (ImportError, OSError, ValueError, ElementTree.ParseError) as error:
         parser.exit(1, f"Ошибка: {error}\n")
-    print(f"Сохранено в {paths[2]}. Строк данных: {rows}.")
+    print(f"Сохранено в {destination}. Строк данных: {rows}.")
     if missing:
         print("Следующие старые IRI не найдены в исходной модели. Их наименования оставлены пустыми:",
               file=sys.stderr)
