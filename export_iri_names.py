@@ -217,7 +217,7 @@ def choose_files(replace=False):
         title = "Выберите модель маппинга для замены IRI" if replace else "Выберите исходную OWL-модель со старыми IRI"
         source = filedialog.askopenfilename(
             parent=root, title=title,
-            filetypes=[("Модель OWL", "*.owl"), ("Все файлы", "*")],
+            filetypes=[("Модели OWL и RDF", ("*.owl", "*.rdf")), ("Все файлы", "*")],
         )
         if not source:
             return None
